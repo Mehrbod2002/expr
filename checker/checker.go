@@ -1,6 +1,7 @@
 package checker
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 	"regexp"
@@ -965,20 +966,29 @@ func (v *checker) checkArguments(
 
 	if withContext && len(arguments) > 1 {
 		seenArgs := make(map[string]bool)
+		newArgs := make([]ast.Node, 0, len(arguments))
 
 		for _, arg := range arguments {
 			argType := arg.Type()
 			argName := arg.String()
+
+			if argType.Implements(reflect.TypeOf((*context.Context)(nil)).Elem()) {
+				interfaceType := reflect.TypeOf((*interface{})(nil)).Elem()
+				interfaceVal := reflect.ValueOf(arg).Convert(interfaceType)
+				argType = interfaceVal.Type()
+			}
+
 			key := fmt.Sprintf("%s:%s", argType, argName)
 
 			if seenArgs[key] {
-				return unknown, &file.Error{
-					Location: arg.Location(),
-					Message:  fmt.Sprintf("duplicate argument (type %s, name %s) in function call %v", argType, argName, name),
-				}
+				continue
 			}
+
 			seenArgs[key] = true
+			newArgs = append(newArgs, arg)
 		}
+
+		arguments = newArgs
 	}
 
 	var err *file.Error
