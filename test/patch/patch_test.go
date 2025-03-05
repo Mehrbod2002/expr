@@ -1,6 +1,8 @@
 package patch_test
 
 import (
+	"context"
+	"fmt"
 	"testing"
 
 	"github.com/expr-lang/expr/internal/testify/require"
@@ -36,4 +38,26 @@ func TestPatch_length(t *testing.T) {
 	output, err := expr.Run(program, env)
 	require.NoError(t, err)
 	require.Equal(t, true, output)
+}
+
+type X struct{}
+
+func (x *X) HelloCtx(ctx context.Context, text string) error {
+	fmt.Println("hello:", text)
+	return nil
+}
+
+func TestGoexrEngine(t *testing.T) {
+	env := map[string]any{
+		"_goctx_": context.TODO(),
+		"_g_": map[string]*X{
+			"rpc": &X{},
+		},
+		"text": "gonghuan",
+	}
+
+	exprStr := `let v = _g_.rpc.HelloCtx(_goctx_, text); v`
+
+	_, err := expr.Compile(exprStr, expr.Env(env), expr.WithContext("_goctx_"))
+	require.NoError(t, err)
 }

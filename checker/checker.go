@@ -110,17 +110,6 @@ type varScope struct {
 	nature Nature
 }
 
-type info struct {
-	method bool
-	fn     *builtin.Function
-
-	// elem is element type of array or map.
-	// Arrays created with type []any, but
-	// we would like to detect expressions
-	// like `42 in ["a"]` as invalid.
-	elem reflect.Type
-}
-
 func (v *checker) visit(node ast.Node) Nature {
 	var nt Nature
 	switch n := node.(type) {
@@ -391,7 +380,7 @@ func (v *checker) BinaryNode(node *ast.BinaryNode) Nature {
 		if s, ok := node.Right.(*ast.StringNode); ok {
 			_, err := regexp.Compile(s.Value)
 			if err != nil {
-				return v.error(node, err.Error())
+				return v.error(node, "%s", err.Error())
 			}
 		}
 		if isString(l) && isString(r) {
@@ -550,7 +539,7 @@ func (v *checker) SliceNode(node *ast.SliceNode) Nature {
 }
 
 func (v *checker) CallNode(node *ast.CallNode) Nature {
-	nt := v.functionReturnType(node)
+	nt := v.functionReturnType(node, len(v.config.Visitors) > 0)
 
 	// Check if type was set on node (for example, by patcher)
 	// and use node type instead of function return type.
@@ -570,11 +559,11 @@ func (v *checker) CallNode(node *ast.CallNode) Nature {
 	return nt
 }
 
-func (v *checker) functionReturnType(node *ast.CallNode) Nature {
+func (v *checker) functionReturnType(node *ast.CallNode, withContext bool) Nature {
 	nt := v.visit(node.Callee)
 
 	if nt.Func != nil {
-		return v.checkFunction(nt.Func, node, node.Arguments)
+		return v.checkFunction(nt.Func, node, node.Arguments, withContext)
 	}
 
 	fnName := "function"
@@ -597,7 +586,7 @@ func (v *checker) functionReturnType(node *ast.CallNode) Nature {
 
 	switch nt.Kind() {
 	case reflect.Func:
-		outType, err := v.checkArguments(fnName, nt, node.Arguments, node)
+		outType, err := v.checkArguments(fnName, nt, node.Arguments, node, withContext)
 		if err != nil {
 			if v.err == nil {
 				v.err = err
@@ -834,7 +823,7 @@ func (v *checker) BuiltinNode(node *ast.BuiltinNode) Nature {
 		case "get":
 			return v.checkBuiltinGet(node)
 		}
-		return v.checkFunction(builtin.Builtins[id], node, node.Arguments)
+		return v.checkFunction(builtin.Builtins[id], node, node.Arguments, false)
 	}
 
 	return v.error(node, "unknown builtin %v", node.Name)
@@ -893,7 +882,7 @@ func (v *checker) checkBuiltinGet(node *ast.BuiltinNode) Nature {
 	return v.error(node.Arguments[0], "type %v does not support indexing", base)
 }
 
-func (v *checker) checkFunction(f *builtin.Function, node ast.Node, arguments []ast.Node) Nature {
+func (v *checker) checkFunction(f *builtin.Function, node ast.Node, arguments []ast.Node, withContext bool) Nature {
 	if f.Validate != nil {
 		args := make([]reflect.Type, len(arguments))
 		for i, arg := range arguments {
@@ -910,7 +899,7 @@ func (v *checker) checkFunction(f *builtin.Function, node ast.Node, arguments []
 		}
 		return Nature{Type: t}
 	} else if len(f.Types) == 0 {
-		nt, err := v.checkArguments(f.Name, Nature{Type: f.Type()}, arguments, node)
+		nt, err := v.checkArguments(f.Name, Nature{Type: f.Type()}, arguments, node, withContext)
 		if err != nil {
 			if v.err == nil {
 				v.err = err
@@ -922,7 +911,7 @@ func (v *checker) checkFunction(f *builtin.Function, node ast.Node, arguments []
 	}
 	var lastErr *file.Error
 	for _, t := range f.Types {
-		outNature, err := v.checkArguments(f.Name, Nature{Type: t}, arguments, node)
+		outNature, err := v.checkArguments(f.Name, Nature{Type: t}, arguments, node, withContext)
 		if err != nil {
 			lastErr = err
 			continue
@@ -944,6 +933,7 @@ func (v *checker) checkArguments(
 	fn Nature,
 	arguments []ast.Node,
 	node ast.Node,
+	withContext bool,
 ) (Nature, *file.Error) {
 	if isUnknown(fn) {
 		return unknown, nil
@@ -955,23 +945,40 @@ func (v *checker) checkArguments(
 			Message:  fmt.Sprintf("func %v doesn't return value", name),
 		}
 	}
-	if numOut := fn.NumOut(); numOut > 2 {
+
+	if fn.NumOut() > 2 {
 		return unknown, &file.Error{
 			Location: node.Location(),
-			Message:  fmt.Sprintf("func %v returns more then two values", name),
+			Message:  fmt.Sprintf("func %v returns more than two values", name),
 		}
 	}
 
-	// If func is method on an env, first argument should be a receiver,
-	// and actual arguments less than fnNumIn by one.
 	fnNumIn := fn.NumIn()
-	if fn.Method { // TODO: Move subtraction to the Nature.NumIn() and Nature.In() methods.
-		fnNumIn--
-	}
-	// Skip first argument in case of the receiver.
 	fnInOffset := 0
+
 	if fn.Method {
+		fnNumIn--
 		fnInOffset = 1
+	}
+
+	expectedArgs := fnNumIn
+
+	if withContext && len(arguments) > 1 {
+		seenArgs := make(map[string]bool)
+
+		for _, arg := range arguments {
+			argType := arg.Type()
+			argName := arg.String()
+			key := fmt.Sprintf("%s:%s", argType, argName)
+
+			if seenArgs[key] {
+				return unknown, &file.Error{
+					Location: arg.Location(),
+					Message:  fmt.Sprintf("duplicate argument (type %s, name %s) in function call %v", argType, argName, name),
+				}
+			}
+			seenArgs[key] = true
+		}
 	}
 
 	var err *file.Error
@@ -998,21 +1005,18 @@ func (v *checker) checkArguments(
 	}
 
 	if err != nil {
-		// If we have an error, we should still visit all arguments to
-		// type check them, as a patch can fix the error later.
 		for _, arg := range arguments {
 			_ = v.visit(arg)
 		}
 		return fn.Out(0), err
 	}
 
+	// Type checking for each argument
 	for i, arg := range arguments {
 		argNature := v.visit(arg)
 
 		var in Nature
-		if fn.IsVariadic() && i >= fnNumIn-1 {
-			// For variadic arguments fn(xs ...int), go replaces type of xs (int) with ([]int).
-			// As we compare arguments one by one, we need underling type.
+		if fn.IsVariadic() && i >= expectedArgs-1 {
 			in = fn.In(fn.NumIn() - 1).Elem()
 		} else {
 			in = fn.In(i + fnInOffset)
@@ -1038,20 +1042,10 @@ func (v *checker) checkArguments(
 			}
 		}
 
-		// Check if argument is assignable to the function input type.
-		// We check original type (like *time.Time), not dereferenced type,
-		// as function input type can be pointer to a struct.
-		assignable := argNature.AssignableTo(in)
-
-		// We also need to check if dereference arg type is assignable to the function input type.
-		// For example, func(int) and argument *int. In this case we will add OpDeref to the argument,
-		// so we can call the function with *int argument.
-		assignable = assignable || argNature.Deref().AssignableTo(in)
-
-		if !assignable && !isUnknown(argNature) {
+		if !argNature.AssignableTo(in) && !argNature.Deref().AssignableTo(in) && !isUnknown(argNature) {
 			return unknown, &file.Error{
 				Location: arg.Location(),
-				Message:  fmt.Sprintf("cannot use %s as argument (type %s) to call %v ", argNature, in, name),
+				Message:  fmt.Sprintf("cannot use %s as argument (type %s) to call %v", argNature, in, name),
 			}
 		}
 	}
