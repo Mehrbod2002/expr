@@ -6,7 +6,7 @@ import (
 	"github.com/expr-lang/expr/ast"
 )
 
-// WithContext adds WithContext.Name argument to all functions calls with a context.Context argument.
+// WithContext adds WithContext.Name as the first argument for functions that expect a context.Context argument.
 type WithContext struct {
 	Name string
 }
@@ -36,10 +36,8 @@ func (w WithContext) Visit(node *ast.Node) {
 			}
 		}
 		ast.Patch(node, &ast.CallNode{
-			Callee: call.Callee,
-			Arguments: append([]ast.Node{
-				&ast.IdentifierNode{Value: w.Name},
-			}, call.Arguments...),
+			Callee:    call.Callee,
+			Arguments: append([]ast.Node{&ast.IdentifierNode{Value: w.Name}}, call.Arguments...),
 		})
 	}
 }
